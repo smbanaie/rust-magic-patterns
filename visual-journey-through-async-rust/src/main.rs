@@ -3,13 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::FutureExt;
+use futures::{channel::oneshot, FutureExt};
 use pyo3::{ffi::c_str, prelude::*, IntoPyObject, Python};
 use serde::Serialize;
-use tokio::sync::mpsc;
 
-const N: usize = 500;
-const K: f32 = 16. * PI / N as f32;
+const N: usize = 100;
+const K: f32 = 8. * PI / N as f32;
 
 #[derive(Serialize, Debug, IntoPyObject, Clone)]
 struct Sample {
@@ -20,73 +19,68 @@ struct Sample {
     thread_id: usize,
 }
 
-fn sin(i: usize) -> f32 {
+fn sin(x: f32) -> f32 {
     std::thread::sleep(Duration::from_micros(100));
-    (K * i as f32).sin()
+    x.sin()
 }
 
-fn sin_heavy(i: usize) -> f32 {
+fn sin_heavy(x: f32) -> f32 {
     std::thread::sleep(Duration::from_micros(500));
-    (K * i as f32).sin()
+    x.sin()
 }
 
-async fn produce_sin(
-    run_start: Instant,
-    fut_name: impl ToString,
-    tx: mpsc::UnboundedSender<Sample>,
-) {
-    for i in 1..N {
+async fn produce_sin(run_start: Instant, fut_name: impl ToString) -> Vec<Sample> {
+    let mut samples = Vec::new();
+
+    for i in 0..N {
         let start = run_start.elapsed().as_micros();
-        let value = sin(i);
+        let value = sin(i as f32 * K);
         let end = run_start.elapsed().as_micros();
 
-        let sample = Sample {
+        samples.push(Sample {
             fut_name: fut_name.to_string(),
             value,
             start,
             end,
             thread_id: thread_id::get(),
-        };
+        });
 
-        tx.send(sample).unwrap();
         tokio::task::yield_now().await;
     }
+
+    samples
 }
 
-async fn produce_sin_heavy(
-    run_start: Instant,
-    fut_name: impl ToString,
-    tx: mpsc::UnboundedSender<Sample>,
-) {
-    for i in 1..N {
+async fn produce_sin_heavy(run_start: Instant, fut_name: impl ToString) -> Vec<Sample> {
+    let mut samples = Vec::new();
+
+    for i in 0..N {
         let start = run_start.elapsed().as_micros();
-        let value = sin_heavy(i);
+        let value = sin_heavy(i as f32 * K);
         let end = run_start.elapsed().as_micros();
 
-        let sample = Sample {
+        samples.push(Sample {
             fut_name: fut_name.to_string(),
             value,
             start,
             end,
             thread_id: thread_id::get(),
-        };
+        });
 
-        tx.send(sample).unwrap();
         tokio::task::yield_now().await;
     }
+
+    samples
 }
 
-async fn produce_sin_heavy_blocking(
-    run_start: Instant,
-    fut_name: impl ToString,
-    tx: mpsc::UnboundedSender<Sample>,
-) {
-    for i in 1..N {
+async fn produce_sin_heavy_blocking(run_start: Instant, fut_name: impl ToString) -> Vec<Sample> {
+    let mut samples = Vec::new();
+
+    for i in 0..N {
         let start = run_start.elapsed().as_micros();
-        let tx = tx.clone();
 
         let (t_id, value) = tokio::task::spawn_blocking(move || {
-            let value = sin_heavy(i);
+            let value = sin_heavy(i as f32 * K);
             let t_id = thread_id::get();
 
             (t_id, value)
@@ -96,173 +90,133 @@ async fn produce_sin_heavy_blocking(
 
         let end = run_start.elapsed().as_micros();
 
-        let sample = Sample {
+        samples.push(Sample {
             fut_name: fut_name.to_string(),
             value,
             start,
             end,
             thread_id: t_id,
-        };
-
-        tx.send(sample).unwrap();
+        });
 
         tokio::task::yield_now().await;
     }
+
+    samples
 }
 
 fn plot_samples(
     samples: Vec<Sample>,
     include_times: bool,
     output_filename: &str,
+    zoom: f32,
 ) -> Result<(), pyo3::PyErr> {
+    println!("Plotting {} samples to {output_filename}", samples.len());
     let code = c_str!(include_str!("./py/plot.py"));
 
     Python::with_gil(|py| -> PyResult<()> {
         let module = PyModule::from_code(py, code, c_str!("plot.py"), c_str!("plot"))?;
         let plot_fn = module.getattr("plot")?;
 
-        plot_fn.call1((samples, include_times, output_filename))?;
+        plot_fn.call1((samples, include_times, zoom, output_filename))?;
 
         Ok(())
     })
 }
 
 async fn two_futures() -> Vec<Sample> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
-    futs.push(produce_sin(run_start, "fut1", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
+    futs.push(produce_sin(run_start, "fut1").boxed());
 
-    futures::future::join_all(futs).await;
-    drop(tx);
+    let samples = futures::future::join_all(futs).await;
+    let samples = samples.into_iter().flatten().collect::<Vec<_>>();
 
-    let mut samples = Vec::new();
-
-    while let Some(next) = rx.recv().await {
-        samples.push(next);
-    }
-
-    // draw_samples(samples, false, "output/two_futures.png").unwrap();
     samples
 }
 
 async fn cpu_intensive() -> Vec<Sample> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
-    futs.push(produce_sin(run_start, "fut1", tx.clone()).boxed());
-    futs.push(produce_sin_heavy(run_start, "high cpu", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
+    futs.push(produce_sin(run_start, "fut1").boxed());
+    futs.push(produce_sin_heavy(run_start, "high cpu").boxed());
 
-    futures::future::join_all(futs).await;
-    drop(tx);
+    let samples = futures::future::join_all(futs).await;
 
-    let mut samples = Vec::new();
-
-    while let Some(next) = rx.recv().await {
-        samples.push(next);
-    }
-
-    samples
+    samples.into_iter().flatten().collect::<Vec<_>>()
 }
 
 async fn spawn_task() -> Vec<Sample> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
-    futs.push(produce_sin(run_start, "fut1", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
+    futs.push(produce_sin(run_start, "fut1").boxed());
 
     futs.push(
-        tokio::spawn(produce_sin_heavy(run_start, "spawned", tx.clone()).boxed())
-            .map(|_| ())
+        tokio::spawn(produce_sin_heavy(run_start, "spawned").boxed())
+            .map(|res| res.unwrap())
             .boxed(),
     );
 
-    futures::future::join_all(futs).await;
-    drop(tx);
-
-    let mut samples = Vec::new();
-
-    while let Some(next) = rx.recv().await {
-        samples.push(next);
-    }
+    let samples = futures::future::join_all(futs).await;
+    let samples = samples.into_iter().flatten().collect::<Vec<_>>();
 
     samples
 }
 
 async fn many_spawn_task() -> Vec<Sample> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
 
     for i in 1..7 {
         futs.push(
-            tokio::spawn(produce_sin_heavy(run_start, format!("spawned{i}"), tx.clone()).boxed())
-                .map(|_| ())
+            tokio::spawn(produce_sin_heavy(run_start, format!("spawned{i}")))
+                .map(|res| res.unwrap())
                 .boxed(),
         );
     }
 
-    futures::future::join_all(futs).await;
-    drop(tx);
-
-    let mut samples = Vec::new();
-
-    while let Some(next) = rx.recv().await {
-        samples.push(next);
-    }
+    let samples = futures::future::join_all(futs).await;
+    let samples = samples.into_iter().flatten().collect::<Vec<_>>();
 
     samples
 }
 
 async fn many_spawn_blocking() -> Vec<Sample> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
 
     for i in 1..7 {
-        futs.push(
-            produce_sin_heavy_blocking(run_start, format!("spawn_\nblocking{i}"), tx.clone())
-                .boxed(),
-        );
+        futs.push(produce_sin_heavy_blocking(run_start, format!("spawn_\nblocking{i}")).boxed());
     }
 
-    futures::future::join_all(futs).await;
-    drop(tx);
-
-    let mut samples = Vec::new();
-
-    while let Some(next) = rx.recv().await {
-        samples.push(next);
-    }
+    let samples = futures::future::join_all(futs).await;
+    let samples = samples.into_iter().flatten().collect::<Vec<_>>();
 
     samples
 }
 
-fn zoom(samples: Vec<Sample>, ratio: f32) -> Vec<Sample> {
-    let min_start = samples.iter().map(|s| s.start).min().unwrap();
-    let max_end = samples.iter().map(|s| s.end).max().unwrap();
+async fn rayon_sin_heavy(i: f32) -> f32 {
+    let (tx, rx) = oneshot::channel();
 
-    let threshold = ((max_end - min_start) as f32 * ratio) as u128;
+    rayon::spawn(move || {
+        tx.send(sin_heavy(i)).expect("Failed to send result");
+    });
 
-    samples
-        .into_iter()
-        .filter(|s| s.start < threshold)
-        .collect()
+    rx.await.expect("Failed to receive result")
 }
 
 #[tokio::main]
@@ -274,36 +228,53 @@ async fn main() -> anyhow::Result<()> {
         two_futures_samples.clone(),
         false,
         "resources/two_futures.png",
+        1.,
+    )?;
+    plot_samples(
+        two_futures_samples.clone(),
+        false,
+        "resources/two_futures.png",
+        1.,
     )?;
     plot_samples(
         two_futures_samples.clone(),
         true,
         "resources/two_futures_with_times.png",
+        1.,
     )?;
     plot_samples(
-        zoom(two_futures_samples, 0.05),
+        two_futures_samples,
         true,
         "resources/two_futures_zoom.png",
+        0.25,
     )?;
 
     let spawn_task_samples = spawn_task().await;
-    plot_samples(spawn_task_samples.clone(), true, "resources/spawn_task.png")?;
     plot_samples(
-        zoom(spawn_task_samples, 0.05),
+        spawn_task_samples.clone(),
+        true,
+        "resources/spawn_task.png",
+        1.,
+    )?;
+    plot_samples(
+        spawn_task_samples,
         true,
         "resources/spawn_task_zoom.png",
+        0.25,
     )?;
 
     let many_spawn_task_samples = many_spawn_task().await;
     plot_samples(
         many_spawn_task_samples.clone(),
         true,
-        "resources/_many_spawn_task.png",
+        "resources/many_spawn_task.png",
+        1.,
     )?;
     plot_samples(
-        zoom(many_spawn_task_samples, 0.05),
+        many_spawn_task_samples,
         true,
-        "resources/_many_spawn_task_zoom.png",
+        "resources/many_spawn_task_zoom.png",
+        0.25,
     )?;
 
     let cpu_intensive_samples = cpu_intensive().await;
@@ -311,11 +282,13 @@ async fn main() -> anyhow::Result<()> {
         cpu_intensive_samples.clone(),
         true,
         "resources/cpu_intensive.png",
+        1.,
     )?;
     plot_samples(
-        zoom(cpu_intensive_samples, 0.05),
+        cpu_intensive_samples,
         true,
         "resources/cpu_intensive_zoom.png",
+        0.25,
     )?;
 
     let many_spawn_blocking_samples = many_spawn_blocking().await;
@@ -323,11 +296,13 @@ async fn main() -> anyhow::Result<()> {
         many_spawn_blocking_samples.clone(),
         true,
         "resources/many_spawn_blocking.png",
+        1.,
     )?;
     plot_samples(
-        zoom(many_spawn_blocking_samples, 0.05),
+        many_spawn_blocking_samples,
         true,
         "resources/many_spawn_blocking_zoom.png",
+        0.25,
     )?;
 
     Ok(())

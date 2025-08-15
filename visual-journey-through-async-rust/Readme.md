@@ -6,7 +6,7 @@ I'm a visual and experimental learner. To truly understand something, I need to 
 All visualization code is available [here](./src/main.rs)
 
 To visualize the passing of time, we'll plot out some shape. A simple [sine wave](https://en.wikipedia.org/wiki/Sine_and_cosine) will do nicely.  
-First, we create a future that asynchronously computes `N` values of the sine function. In each iteration, we compute a value and `yield_now().await` to yield execution to other futures. We send these computed values to a channel and later use [matplotlib](https://matplotlib.org/) and [pyo3](https://github.com/PyO3/pyo3) to graphically display the results.
+First, we create a future that asynchronously computes `N` values of the sine function. In each iteration, we compute a value and `yield_now().await` to yield execution to other futures. We save these computed values and later use [matplotlib](https://matplotlib.org/) and [pyo3](https://github.com/PyO3/pyo3) to graphically display the results.
 
 ```rust
 /// Each calculated sine value is a sample we keep track of
@@ -16,15 +16,19 @@ struct Sample {
     t: u128
 }
 
-async fn produce_sin(run_start: Instant, fut_name: String, tx: mpsc::UnboundedSender<Sample>) {
-    for i in 1..N {
-        let t = run_start.elapsed().as_micros();
-        let value = sin(i);
+async fn produce_sin(run_start: Instant, fut_name: String) -> Vec<Sample> {
+    let mut samples = Vec::new();
 
-        tx.send(Sample { fut_name, value, t }).unwrap();
-        // yield execution so that other futures can do their thing
+    for i in 0..N {
+        let t = run_start.elapsed().as_micros();
+        let value = sin(i as f32 * K);
+
+        samples.push(Sample { fut_name, value, t });
+
         tokio::task::yield_now().await;
     }
+
+    samples
 }
 ```
 
@@ -33,19 +37,16 @@ Now, let's create a couple of these and see our two sine waves calculated side b
 ```rust
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut1", tx.clone()).boxed());
-    futs.push(produce_sin(run_start, "fut2", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut1").boxed());
+    futs.push(produce_sin(run_start, "fut2").boxed());
 
-    futures::future::join_all(futs).await;
+    let samples = futures::future::join_all(futs).await;
 
-    drop(tx);
-    plot_samples(rx).await;
+    plot_samples(samples).await;
 }
 ```
 
@@ -67,15 +68,19 @@ struct Sample {
     end_t: u128
 }
 
-async fn produce_sin(run_start: Instant, fut_name: String, tx: mpsc::UnboundedSender<Sample>) {
-    for i in 1..N {
+async fn produce_sin(run_start: Instant, fut_name: String) -> Vec<Sample> {
+    let mut samples = Vec::new();
+    
+    for i in 0..N {
         let start_t = run_start.elapsed().as_micros();
-        let value = sin(i);
+        let value = sin(i as f32 * K);
         let end_t = run_start.elapsed().as_micros();
 
-        tx.send(Sample { fut_name, value, start_t, end_t }).unwrap();
+        samples.push((Sample { fut_name, value, start_t, end_t }));
         tokio::task::yield_now().await;
     }
+
+    samples
 }
 ```
 
@@ -106,20 +111,17 @@ Let's add a future that produces sine values using `sin_high_cpu()`:
 ```rust
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
-    futs.push(produce_sin(run_start, "fut1", tx.clone()).boxed());
-    futs.push(produce_sin_high_cpu(run_start, "high cpu", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
+    futs.push(produce_sin(run_start, "fut1").boxed());
+    futs.push(produce_sin_high_cpu(run_start, "high cpu").boxed());
 
-    futures::future::join_all(futs).await;
+    let samples = futures::future::join_all(futs).await;
 
-    drop(tx);
-    plot_samples(rx).await;
+    plot_samples(samples).await;
 }
 ```
 
@@ -150,24 +152,21 @@ Let's spawn `produce_sin_high_cpu` in a Tokio task and see how it affects the pl
 ```rust
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
-    futs.push(produce_sin(run_start, "fut1", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
+    futs.push(produce_sin(run_start, "fut1").boxed());
     futs.push(
-        tokio::spawn(produce_sin_high_cpu(run_start, "spawned", tx.clone()).boxed())
-            .map(|_| ()) // we need to replace the return value with () to match the other futures
+        tokio::spawn(produce_sin_high_cpu(run_start, "spawned").boxed())
+            .map(|res| res.unwrap())
             .boxed(),
     );
 
-    futures::future::join_all(futs).await;
+    let samples = futures::future::join_all(futs).await;
 
-    drop(tx);
-    plot_samples(rx).await;
+    plot_samples(samples).await;
 }
 ```
 
@@ -194,27 +193,24 @@ Ok, so if Tokio's multithreaded runtime has 1+4 available threads, what will hap
 ```rust
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
     let mut futs = Vec::new();
 
     let run_start = Instant::now();
 
-    futs.push(produce_sin(run_start, "fut0", tx.clone()).boxed());
+    futs.push(produce_sin(run_start, "fut0").boxed());
 
     for i in 1..7 {
         let fut_name = format!("spawned{i}");
         futs.push(
-            tokio::spawn(produce_sin_heavy(run_start, fut_name, tx.clone()).boxed())
-                .map(|_| ())
+            tokio::spawn(produce_sin_heavy(run_start, fut_name).boxed())
+                .map(|res| res.unwrap())
                 .boxed(),
         );
     }
 
-    futures::future::join_all(futs).await;
+    let samples = futures::future::join_all(futs).await;
 
-    drop(tx);
-    plot_samples(rx).await;
+    plot_samples(samples).await;
 }
 ```
 
@@ -230,7 +226,7 @@ And zoomed in:
     <img src="./resources/many_spawn_task_zoom.png">
 </p>
 
-Tokio juggles the tasks between the threads. Each future polling might run in a different thread. Since we don't have enough available threads, our CPU-bound issues manifest again, and sometimes one task can stall work on other tasks. Interesting. Spawning new tasks improves parallelism, but with a hard limit. This is something we should definitely remember. In our example, look at the "spawned2" future. Note how this future and task are contending with "spawned4" and "spawned5" on the brown and gray threads.
+Tokio juggles the tasks between the threads. Each future polling might run in a different thread. Since we don't have enough available threads, our CPU-bound issues manifest again, and sometimes one task can stall work on other tasks. Interesting. Spawning new tasks improves parallelism, but with a hard limit. This is something we should definitely remember. In our example, look at the "spawned2" future. Note how this future and task are contending with "spawned3" and "spawned4" on the brown, green, and gray threads.
 
 ## Spawn Blocking
 Another relevant tool in Tokio's tool belt is [tokio::task::spawn_blocking()](https://docs.rs/tokio/latest/tokio/#cpu-bound-tasks-and-blocking-code). `spawn_blocking()` will spawn a block of (non-async) code in a dedicated thread pool — the **blocking** pool. This thread pool maintains a much larger thread pool.
@@ -240,15 +236,15 @@ Let's add a version of our sine producer that runs `sin_heavy()` under a `spawn_
 ```rust
 async fn produce_sin_heavy_blocking(
     run_start: Instant,
-    fut_name: String,
-    tx: mpsc::UnboundedSender<Sample>,
-) {
-    for i in 1..N {
+    fut_name: String
+) -> Vec<Sample> {
+    let mut samples = Vec::new();
+
+    for i in 0..N {
         let start = run_start.elapsed().as_micros();
-        let tx = tx.clone();
 
         let (t_id, value) = tokio::task::spawn_blocking(move || {
-            let value = sin_heavy(i);
+            let value = sin_heavy(i as f32 * K);
             let t_id = thread_id::get();
 
             (t_id, value)
@@ -258,12 +254,12 @@ async fn produce_sin_heavy_blocking(
 
         let end = run_start.elapsed().as_micros();
 
-        let sample = Sample { fut_name, value, start, end, thread_id: t_id };
-
-        tx.send(sample).unwrap();
+        samples.push(Sample { fut_name, value, start, end, thread_id: t_id });
 
         tokio::task::yield_now().await;
     }
+
+    samples
 }
 ```
 
